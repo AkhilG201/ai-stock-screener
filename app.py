@@ -1,56 +1,167 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import numpy as np
+import yfinance as yf
 import plotly.graph_objs as go
 
-st.set_page_config(page_title="AI Stock Screener", layout="wide")
+st.set_page_config(page_title="AI Stock Screener (NSE)", layout="wide")
+st.title("📈 AI Stock Screener – Fundamentals + Technicals + Score (Buy / Hold / Sell)")
 
-st.title("📈 AI-Powered Stock Screener for NSE")
+@st.cache_data(ttl=900)
+def get_history(symbol, period="2y", interval="1d"):
+    return yf.download(symbol, period=period, interval=interval, auto_adjust=True)
 
-symbol = st.text_input("🔍 Enter NSE stock symbol (e.g., RELIANCE.NS, INFY.NS)", value="RELIANCE.NS")
-
-if symbol:
+@st.cache_data(ttl=900)
+def get_info(symbol):
     try:
-        stock = yf.Ticker(symbol)
-        hist = stock.history(period="1y")
-        info = stock.info
+        return yf.Ticker(symbol).info
+    except Exception:
+        return {}
 
-        st.subheader(f"Company: {info.get('shortName', 'N/A')}")
-        sector = info.get('sector', 'N/A')
-        market_cap = f"₹{info.get('marketCap', 0):,}" if info.get('marketCap') else 'N/A'
-        pe_ratio = info.get('trailingPE', 'N/A')
-        high_52w = info.get('fiftyTwoWeekHigh', 'N/A')
-        low_52w = info.get('fiftyTwoWeekLow', 'N/A')
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
-        st.markdown(f"""
-        - **Sector**: {sector}
-        - **Market Cap**: {market_cap}
-        - **PE Ratio**: {pe_ratio}
-        - **52W High**: ₹{high_52w}
-        - **52W Low**: ₹{low_52w}
-        """)
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain).rolling(period).mean()
+    roll_down = pd.Series(loss).rolling(period).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    rsi_val = 100 - (100 / (1 + rs))
+    return pd.Series(rsi_val, index=series.index)
 
-        st.subheader("📊 Live Chart (1Y)")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], name="Close Price"))
-        fig.update_layout(title=f"{symbol} Stock Price", xaxis_title="Date", yaxis_title="Price (₹)")
-        st.plotly_chart(fig, use_container_width=True)
+def macd(series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-        df_stats = pd.DataFrame.from_dict(info, orient='index', columns=['Value']).dropna()
-        st.subheader("📑 Full Financial Metrics")
-        st.dataframe(df_stats)
+def pct(a, low, high, reverse=False):
+    if a is None or np.isnan(a):
+        return 0
+    a = max(min(a, high), low)
+    score = (a - low) / (high - low) * 100
+    return 100 - score if reverse else score
 
-        st.download_button("📥 Download Financials to CSV", df_stats.to_csv().encode('utf-8'), f"{symbol}_metrics.csv", "text/csv")
+def classify(score):
+    if score >= 70:
+        return "✅ Buy"
+    elif score >= 40:
+        return "🤝 Hold"
+    else:
+        return "❌ Sell"
 
-        st.subheader("💡 AI Recommendation (Demo)")
-        pe = info.get("trailingPE", None)
-        rating = "Hold"
-        if pe:
-            if pe < 15:
-                rating = "Buy"
-            elif pe > 30:
-                rating = "Sell"
-        st.success(f"✅ **Recommendation**: {rating} (based on PE Ratio)")
+def analyze_symbol(symbol):
+    info = get_info(symbol)
+    hist = get_history(symbol)
 
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
+    if hist.empty:
+        return None
+
+    close = hist["Close"]
+    last_price = close.iloc[-1]
+
+    # Technical analysis
+    ma50 = close.rolling(50).mean()
+    ma200 = close.rolling(200).mean()
+    rsi14 = rsi(close, 14)
+    macd_line, signal_line, macd_hist = macd(close)
+
+    tech_score = 0
+    tech_score += 10 if last_price > ma200.iloc[-1] else 0
+    tech_score += 8 if ma50.iloc[-1] > ma200.iloc[-1] else 0
+    tech_score += 6 if 40 <= rsi14.iloc[-1] <= 60 else 0
+    tech_score += 8 if macd_line.iloc[-1] > signal_line.iloc[-1] else 0
+    tech_score += 8 if last_price >= (hist["Close"].rolling(252).max().iloc[-1] * 0.9) else 0
+
+    # Fundamental analysis
+    pe = info.get("trailingPE", np.nan)
+    pb = info.get("priceToBook", np.nan)
+    roe = info.get("returnOnEquity", np.nan)
+    d2e = info.get("debtToEquity", np.nan)
+    rev_g = info.get("revenueGrowth", np.nan)
+    pm = info.get("profitMargins", np.nan)
+
+    pe_score = pct(pe, 5, 40, reverse=True)
+    pb_score = pct(pb, 0.5, 8, reverse=True)
+    roe_score = pct((roe or 0) * 100, 5, 30)
+    d2e_score = pct(d2e, 0, 1.0, reverse=True)
+    rev_g_score = pct((rev_g or 0) * 100, 0, 30)
+    pm_score = pct((pm or 0) * 100, 0, 25)
+
+    fundamentals_weighted = (
+        12 * (pe_score / 100) +
+        8  * (pb_score / 100) +
+        14 * (roe_score / 100) +
+        10 * (d2e_score / 100) +
+        8  * (rev_g_score / 100) +
+        8  * (pm_score / 100)
+    )
+    fundamental_score = fundamentals_weighted
+
+    total_score = round(fundamental_score + tech_score, 2)
+    signal = classify(total_score)
+
+    return {
+        "Symbol": symbol,
+        "Name": info.get("shortName", symbol),
+        "Price": round(last_price, 2),
+        "P/E": round(pe, 2) if pe and not np.isnan(pe) else None,
+        "P/B": round(pb, 2) if pb and not np.isnan(pb) else None,
+        "ROE (%)": round((roe or 0) * 100, 2) if roe else None,
+        "Debt/Equity": round(d2e, 2) if d2e and not np.isnan(d2e) else None,
+        "Rev Growth (%)": round((rev_g or 0) * 100, 2) if rev_g else None,
+        "Profit Margin (%)": round((pm or 0) * 100, 2) if pm else None,
+        "RSI(14)": round(rsi14.iloc[-1], 2) if not np.isnan(rsi14.iloc[-1]) else None,
+        "Tech Score (40)": round(tech_score, 2),
+        "Fund Score (60)": round(fundamental_score, 2),
+        "Total Score (100)": total_score,
+        "Call": signal,
+        "Hist": hist
+    }
+
+symbols = st.text_area(
+    "Enter NSE symbols (comma-separated) – e.g. RELIANCE.NS, TCS.NS, INFY.NS",
+    value="RELIANCE.NS, TCS.NS, INFY.NS"
+)
+symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+run_btn = st.button("Run Analysis")
+
+if run_btn and symbols:
+    results = []
+    with st.spinner("Fetching & analysing..."):
+        for s in symbols:
+            r = analyze_symbol(s)
+            if r: results.append(r)
+
+    if not results:
+        st.error("No valid data returned. Check symbols.")
+    else:
+        df = pd.DataFrame([
+            {k: v for k, v in d.items() if k != "Hist"} for d in results
+        ])
+        df = df.sort_values("Total Score (100)", ascending=False)
+        st.subheader("📊 Screener Results")
+        st.dataframe(df, use_container_width=True)
+        st.download_button(
+            "📥 Download CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            "screener_results.csv",
+            "text/csv"
+        )
+
+        st.subheader("📈 Chart & Indicators")
+        symbol_to_plot = st.selectbox("Select a symbol to view chart", df["Symbol"].tolist())
+        if symbol_to_plot:
+            item = next(d for d in results if d["Symbol"] == symbol_to_plot)
+            hist = item["Hist"]
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=hist.index, open=hist["Open"], high=hist["High"],
+                low=hist["Low"], close=hist["Close"], name="Price"
+            ))
+            fig.update_layout(title=f"{symbol_to_plot} – Price", xaxis_title="Date", yaxis_title="Price (₹)")
+            st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Enter symbols and click **Run Analysis**.")
