@@ -1,10 +1,6 @@
-# AI Stock Screener
+# AI Stock Screener (Fixed)
 
-A Streamlit app that:
-- Fetches NSE stock data (via Yahoo Finance)
-- Performs technical & fundamental analysis
-- Generates Buy/Hold/Sell signals
-- Provides interactive charts and CSV downloads
+This version fixes RSI and adds safe checks for technical analysis.
 
 ## Run Locally
 ```bash
